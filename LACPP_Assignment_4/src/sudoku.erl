@@ -10,7 +10,7 @@
 %% -------------------------------------------------------------------
 -module(sudoku).
 
--export([benchmarks/0, par_benchmarks/0]).
+-export([benchmarks/0, par_benchmarks/0, benchmark/0]).
 
 -ifdef(PROPER).
 -include_lib("proper/include/proper.hrl").
@@ -27,8 +27,10 @@
 %%
 %% benchmarking code
 %%
--define(EXECUTIONS, 42).
+-define(EXECUTIONS, 1).
 -define(PROBLEMS, "sudoku_problems.txt").
+
+-define(BENCHMARK_TARGET, real_challenge).
 
 -spec benchmarks() -> {musecs(), result()}.
 benchmarks() ->
@@ -39,7 +41,16 @@ benchmarks() ->
 benchmarks(Puzzles) ->
   [{Name, bm(fun() -> solve(M) end)} || {Name, M} <- Puzzles].
 
-%% EDIT #1: Parallel benchmarks
+-spec benchmark() -> {musecs(), result()}.
+benchmark() ->
+  {ok, Puzzles} = file:consult(?PROBLEMS),
+  timer:tc(fun () -> benchmark(Puzzles) end).
+
+-spec benchmark([puzzle()]) -> result().
+benchmark(Puzzles) ->
+  [{?BENCHMARK_TARGET, bm(fun() -> solve(M) end)} || {?BENCHMARK_TARGET, M} <- Puzzles].
+
+%% EDIT: Parallel benchmarks
 -spec par_benchmarks() -> {musecs(), result()}.
 par_benchmarks() ->
   {ok, Puzzles} = file:consult(?PROBLEMS),
@@ -51,23 +62,23 @@ par_benchmarks(Puzzles) ->
 	
 	%% Create a link of processes, each process sends a message to Parent containing the value of the benchmark of the
 	%% current puzzle for the current process
-	Pids = [spawn_link(fun() -> send_msg(bm(fun() -> solve(Val) end), Parent) end) || {_, Val} <- Puzzles],
+	Pids = [spawn_link(fun() -> send_msg({Name, bm(fun() -> solve(Val) end)}, Parent) end) || {Name, Val} <- Puzzles],
 
-	%% Now wait for all the processes finishing their tasks (by receiving all their messages)
+	%% Now wait for all the processes to finish their tasks (by receiving all their messages)
 	[receive_msg(Pid) || Pid <- Pids].
-%% EDIT #1 end
+%% EDIT end
 
-%% EDIT #2 Receive and send functions
+%% EDIT: Receive and send functions
 %% Receive message from a process
 receive_msg(FromPid) ->
 	receive
-		{FromPid, T} -> T
+		{FromPid, Msg} -> Msg
 	end.
 
 %% Send message to a process
-send_msg(T, ToPid) ->
-	ToPid ! {self(), T}.
-%% EDIT #2 end
+send_msg(Msg, ToPid) ->
+	ToPid ! {self(), Msg}.
+%% EDIT end
 
 bm(F) ->
   {T, _} = timer:tc(fun () -> repeat(?EXECUTIONS, F) end),
@@ -145,7 +156,7 @@ fill(M) ->
 
 refine(M) ->
   NewM =
-    refine_rows(
+   	par_refine_rows(
       transpose(
 	refine_rows(
 	  transpose(
@@ -159,7 +170,98 @@ refine(M) ->
   end.
 
 refine_rows(M) ->
-  [refine_row(R) || R <- M].
+	[refine_row(R) || R <- M].
+
+%% EDIT: Parallel refine_rows function
+par_refine_rows([]) ->
+	[];
+par_refine_rows([Row|Rest]) ->	
+	Parent = self(),
+	
+	Ref = make_ref(),
+	
+	spawn_link(fun() -> Parent ! {Ref, catch refine_row(Row)} end),
+	
+	NewRest = par_refine_rows(Rest),
+	
+	receive
+		{Ref, NewRow} -> [NewRow | NewRest] 
+	end.
+%% EDIT end
+
+%% EDIT: Parallel refine function (parallel rows, columns and blocks)
+par_refine(M) ->
+	Parent = self(),
+	
+	Ref_block = make_ref(),
+	Ref_col = make_ref(),
+	Ref_row = make_ref(),
+	
+	%% Create process for calculating the blocks
+	spawn_link(fun() -> Parent ! {Ref_block, catch unblocks(refine_rows(blocks(M)))} end),
+	
+	%% Create process for calculating the columns
+	spawn_link(fun() -> Parent ! {Ref_col, catch transpose(refine_rows(transpose(M)))} end),
+	
+	%% Create process for calculating the rows
+	spawn_link(fun() -> Parent ! {Ref_row, catch refine_rows(M)} end),
+	
+	%% Receive blocks result
+	M1 = receive
+			 {Ref_block, A} -> A 
+		 end,
+	
+	%% Receive columns result
+	M2 = receive 
+			 {Ref_col, B} -> B
+		 end,
+	
+	%% Receive rows result
+	M3 = receive
+			 {Ref_row, C} -> C
+		 end,
+	
+	%% Join the three results
+	NewM = join_solutions(M1, M2, M3),
+	
+	if M =:= NewM ->
+		   M;
+	   true ->
+		   refine(NewM)
+	end.
+
+join_solutions(M1, M2, M3) ->
+	[ begin
+		  [ from_list(intersect(C1, intersect(C2, C3)))
+		  || {C1, C2, C3} <- lists:zip3(R1, R2, R3)]
+	  end
+	|| {R1, R2, R3} <- lists:zip3(M1, M2, M3)].
+
+intersect(Ls1, Ls2) ->
+	lists:filter(fun(E) -> lists:member(E, to_list(Ls2)) end, to_list(Ls1)).
+
+to_list(X) ->
+	if is_list(X) -> X;
+	   true ->
+		   [X]
+	end.
+
+from_list([X]) -> X;
+from_list(X) -> X.
+%% EDIT end
+
+%% EDIT: Parallel guesses
+par_solve_one([], Ref, _) ->
+	receive
+		{Ref, Solution} -> Solution
+	end;
+par_solve_one([M|Ms], Ref, Parent) ->
+	spawn(fun() -> Parent ! {Ref, catch solve_refined(M)} end),
+	par_solve_one(Ms, Ref, Parent).
+par_solve_one(Ms) ->
+	Ref = make_ref(),
+	Parent = self(),
+	par_solve_one(Ms, Ref, Parent).
 
 refine_row(Row) ->
   Entries = entries(Row),
